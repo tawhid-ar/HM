@@ -1,0 +1,354 @@
+Hadiya Mart — E-Commerce Platform System Design
+Stack: React (Frontend) + Supabase (Postgres, Auth, Storage, Edge Functions, Realtime) Target: 1000+ concurrent users, sub-2s response time, production-grade, sellable to customers
+
+1. High-Level Architecture
+┌─────────────────────────────────────────────────────────────┐
+│                        CLIENT LAYER                          │
+│  React SPA (Vite) → CDN (Vercel/Netlify/Cloudflare Pages)   │
+│  - Code splitting, lazy loading, image optimization           │
+└───────────────────────────┬───────────────────────────────────┘
+                             │ HTTPS
+┌───────────────────────────▼───────────────────────────────────┐
+│                     SUPABASE (Managed Backend)                 │
+│  ┌──────────────┐  ┌───────────────┐  ┌────────────────────┐ │
+│  │  Auth (JWT)  │  │ PostgREST API │  │  Edge Functions    │ │
+│  │  Row Level   │  │ (Auto-CRUD)   │  │  (business logic,  │ │
+│  │  Security    │  │                │  │  payment webhook)  │ │
+│  └──────────────┘  └───────┬───────┘  └──────────┬─────────┘ │
+│                             │                       │           │
+│                    ┌────────▼───────────────────────▼────────┐ │
+│                    │        PostgreSQL (Primary DB)          │ │
+│                    │   Connection Pooler (PgBouncer/Supavisor)│ │
+│                    └──────────────────────────────────────────┘ │
+│  ┌──────────────┐  ┌───────────────┐                           │
+│  │   Storage    │  │   Realtime    │                           │
+│  │ (product img)│  │ (order status)│                           │
+│  └──────────────┘  └───────────────┘                           │
+└───────────────────────────┬───────────────────────────────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  3rd Party APIs  │
+                    │ Payment(bKash/   │
+                    │ SSLCommerz),     │
+                    │ SMS, Email        │
+                    └───────────────────┘
+কেন এই আর্কিটেকচার product-grade:
+
+Supabase নিজেই Postgres-এর উপর built connection pooling (Supavisor) দেয়, তাই 1000 concurrent connection সরাসরি DB-তে hit করবে না।
+Frontend static build → CDN থেকে serve হবে, তাই server load একদম কম।
+Heavy/sensitive logic (payment, admin approval) Edge Function-এ থাকবে, client-এ না — এতে security + consistency দুটোই নিশ্চিত হয়।
+2. Role & Permission Matrix (RBAC)
+Feature	User	Moderator	Admin	Super Admin
+Product browse/search	✅	✅	✅	✅
+Add to cart / order	✅	❌	❌	❌
+Order tracking (own)	✅	❌	❌	❌
+Profile edit (own)	✅	✅	✅	✅
+Order history (own)	✅	❌	❌	❌
+Product request (suggest new product)	✅	❌	❌	❌
+Order management (all orders)	❌	✅	✅	✅
+Stock view	❌	✅	✅	✅
+Stock add/update	❌	❌	✅	✅
+Product add/edit/delete	❌	❌	✅	✅
+Request new moderator (to admin)	❌	✅	❌	❌
+Approve moderator request	❌	❌	✅	✅
+Manage moderator accounts	❌	❌	✅	✅
+Manage admin accounts	❌	❌	❌	✅
+Manage all users (any role)	❌	❌	❌	✅
+System settings / analytics	❌	❌	Partial	✅
+ডিজাইন প্রিন্সিপাল: Role hierarchy রাখবেন user < moderator < admin < super_admin, এবং permission enforce হবে দুই জায়গায়:
+
+Database level (RLS policies) — আসল security এখানেই, কারণ client-side check bypass করা যায়।
+UI level — শুধু ভালো UX-এর জন্য (button hide/show), security না।
+3. Database Schema (Supabase / Postgres)
+-- ========== ENUM TYPES ==========
+create type user_role as enum ('user', 'moderator', 'admin', 'super_admin');
+create type order_status as enum ('pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled', 'returned');
+create type request_status as enum ('pending', 'approved', 'rejected');
+
+-- ========== PROFILES (extends auth.users) ==========
+create table profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  full_name text not null,
+  phone text,
+  address text,
+  avatar_url text,
+  role user_role not null default 'user',
+  is_active boolean not null default true,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- ========== CATEGORIES ==========
+create table categories (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique,
+  slug text not null unique,
+  parent_id uuid references categories(id),
+  created_at timestamptz default now()
+);
+
+-- ========== PRODUCTS ==========
+create table products (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  slug text not null unique,
+  description text,
+  price numeric(10,2) not null check (price >= 0),
+  discount_price numeric(10,2),
+  category_id uuid references categories(id),
+  images text[] default '{}',
+  stock_quantity integer not null default 0 check (stock_quantity >= 0),
+  sku text unique,
+  is_active boolean default true,
+  created_by uuid references profiles(id),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+create index idx_products_category on products(category_id);
+create index idx_products_active on products(is_active) where is_active = true;
+create index idx_products_name_search on products using gin(to_tsvector('english', name));
+
+-- ========== CART ==========
+create table cart_items (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references profiles(id) on delete cascade,
+  product_id uuid references products(id) on delete cascade,
+  quantity integer not null check (quantity > 0),
+  created_at timestamptz default now(),
+  unique(user_id, product_id)
+);
+
+-- ========== ORDERS ==========
+create table orders (
+  id uuid primary key default gen_random_uuid(),
+  order_number text not null unique,
+  user_id uuid references profiles(id),
+  status order_status not null default 'pending',
+  total_amount numeric(10,2) not null,
+  shipping_address text not null,
+  payment_method text,
+  payment_status text default 'unpaid',
+  handled_by uuid references profiles(id), -- moderator/admin who processed
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+create index idx_orders_user on orders(user_id);
+create index idx_orders_status on orders(status);
+create index idx_orders_created on orders(created_at desc);
+
+create table order_items (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid references orders(id) on delete cascade,
+  product_id uuid references products(id),
+  product_name text not null, -- snapshot (product পরে পরিবর্তন হলেও order history ঠিক থাকবে)
+  price numeric(10,2) not null, -- snapshot
+  quantity integer not null
+);
+create index idx_order_items_order on order_items(order_id);
+
+-- ========== ORDER STATUS HISTORY (tracking) ==========
+create table order_status_history (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid references orders(id) on delete cascade,
+  status order_status not null,
+  note text,
+  changed_by uuid references profiles(id),
+  created_at timestamptz default now()
+);
+
+-- ========== PRODUCT REQUESTS (user asks for new product) ==========
+create table product_requests (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references profiles(id),
+  product_name text not null,
+  description text,
+  status request_status default 'pending',
+  reviewed_by uuid references profiles(id),
+  created_at timestamptz default now()
+);
+
+-- ========== MODERATOR REQUESTS (moderator requests new moderator to admin) ==========
+create table moderator_requests (
+  id uuid primary key default gen_random_uuid(),
+  requested_by uuid references profiles(id), -- moderator who raised request
+  candidate_email text not null,
+  candidate_name text,
+  reason text,
+  status request_status default 'pending',
+  reviewed_by uuid references profiles(id),
+  created_at timestamptz default now()
+);
+
+-- ========== AUDIT LOG (super admin visibility, important for trust/security) ==========
+create table audit_logs (
+  id uuid primary key default gen_random_uuid(),
+  actor_id uuid references profiles(id),
+  action text not null,
+  target_table text,
+  target_id uuid,
+  meta jsonb,
+  created_at timestamptz default now()
+);
+কেন এভাবে ডিজাইন করা:
+order_items-এ product name/price snapshot রাখা হয়েছে, কারণ ভবিষ্যতে product-এর দাম পরিবর্তন হলেও পুরনো order history ভুল দেখাবে না — এটা real e-commerce systems (Amazon, Daraz) সবাই করে।
+audit_logs টেবিল রাখা মানে super admin দেখতে পারবে কে, কখন, কী পরিবর্তন করেছে — এটা customer-কে বিক্রির সময় "trust factor" হিসেবে বড় selling point।
+GIN index দেওয়া হয়েছে full-text search-এর জন্য, যাতে product search fast থাকে হাজার হাজার product-এও।
+4. Row Level Security (RLS) — আসল Security Layer
+Supabase-এ RLS অবশ্যই enable করতে হবে সব টেবিলে। উদাহরণ:
+
+alter table products enable row level security;
+alter table orders enable row level security;
+alter table profiles enable row level security;
+
+-- Helper function: role check
+create or replace function get_user_role()
+returns user_role as $$
+  select role from profiles where id = auth.uid();
+$$ language sql security definer stable;
+
+-- Products: সবাই দেখতে পারবে
+create policy "products_select_all" on products for select using (is_active = true or get_user_role() in ('admin','super_admin','moderator'));
+
+-- Products: শুধু admin/super_admin add/edit করতে পারবে
+create policy "products_insert_admin" on products for insert
+  with check (get_user_role() in ('admin', 'super_admin'));
+
+create policy "products_update_admin" on products for update
+  using (get_user_role() in ('admin', 'super_admin'));
+
+-- Orders: user শুধু নিজের order দেখবে
+create policy "orders_select_own" on orders for select
+  using (auth.uid() = user_id or get_user_role() in ('moderator','admin','super_admin'));
+
+-- Orders: user শুধু নিজের order create করতে পারবে
+create policy "orders_insert_own" on orders for insert
+  with check (auth.uid() = user_id);
+
+-- Orders: শুধু moderator/admin status update করতে পারবে
+create policy "orders_update_staff" on orders for update
+  using (get_user_role() in ('moderator','admin','super_admin'));
+
+-- Profiles: user নিজের profile edit করবে, super_admin সবার
+create policy "profiles_update_own" on profiles for update
+  using (auth.uid() = id or get_user_role() = 'super_admin');
+⚠️ গুরুত্বপূর্ণ: কখনো role column client থেকে user নিজে update করতে পারবে এমন policy দেবেন না — নাহলে একজন সাধারণ user নিজেকে admin বানিয়ে ফেলতে পারবে API call দিয়ে। Role পরিবর্তন শুধু Edge Function দিয়ে, যেটা নিজে verify করবে requester-এর permission আছে কিনা।
+
+5. Business Logic → Edge Functions (Deno)
+Client থেকে সরাসরি sensitive কাজ (stock deduction, order approval, role change) করানো উচিত না — race condition এবং security issue হতে পারে। এগুলো Supabase Edge Function-এ রাখুন:
+
+Edge Function	কাজ
+place-order	Cart validate → stock check → order create → stock deduct (atomic transaction)
+update-order-status	Moderator/admin order status change + history log
+approve-moderator-request	Admin approve করলে user role → moderator update
+manage-role	Super admin only — যেকোনো user-এর role পরিবর্তন
+process-payment-webhook	Payment gateway callback handle
+Stock deduction atomic ভাবে করতে হবে, নাহলে 1000 user একসাথে একই product কিনতে গেলে overselling হবে:
+
+-- Postgres function ব্যবহার করে atomic stock update
+create or replace function place_order(p_items jsonb, p_user_id uuid, p_address text)
+returns uuid as $$
+declare
+  v_order_id uuid;
+  v_item jsonb;
+begin
+  -- lock rows to prevent race condition
+  for v_item in select * from jsonb_array_elements(p_items)
+  loop
+    update products set stock_quantity = stock_quantity - (v_item->>'quantity')::int
+    where id = (v_item->>'product_id')::uuid
+      and stock_quantity >= (v_item->>'quantity')::int;
+    if not found then
+      raise exception 'Insufficient stock for product %', v_item->>'product_id';
+    end if;
+  end loop;
+  -- create order + order_items...
+  return v_order_id;
+end;
+$$ language plpgsql security definer;
+এটা SELECT ... FOR UPDATE behavior-এর মতো কাজ করে — দুইজন একসাথে শেষ item কিনতে চাইলে একজন পাবে, আরেকজন "stock নেই" error পাবে। এটাই real production behavior।
+
+6. Performance & Scalability (1000+ Concurrent Users, <2s response)
+6.1 Database Level
+Connection Pooling: Supabase-এর built-in Supavisor pooler ব্যবহার করুন (transaction mode), direct connection না — 1000 client সরাসরি Postgres-এ connect হলে DB crash করবে।
+Indexing: উপরে schema-তে যেসব index দেওয়া হয়েছে (category, status, created_at, full-text search) — এগুলো query কে O(log n) করবে, full table scan এড়াবে।
+Pagination: কখনো select * করে সব product লোড করবেন না। সবসময় .range(0, 19) টাইপ cursor/offset pagination ব্যবহার করুন (20-30 item per page)।
+Materialized Views (দরকার হলে): Admin dashboard-এর aggregate stats (total sales, popular products) এর জন্য materialized view + periodic refresh, live query না — এতে dashboard load ভারী হবে না।
+6.2 Frontend Level (React)
+Code Splitting: React.lazy() + route-based splitting — user role অনুযায়ী শুধু relevant bundle লোড হবে (admin panel bundle user-এর কাছে যাবে না)।
+Image Optimization: Supabase Storage-এ image upload করার সময় resize/compress করুন (WebP format), অথবা Cloudflare Image Resizing/Transform ব্যবহার করুন। Product listing page-এ thumbnail size, detail page-এ full size।
+React Query / TanStack Query: সব data fetching এর জন্য ব্যবহার করুন — এটা automatic caching, deduplication, background refetch দেয়। একই product data বারবার fetch হবে না।
+Debounce Search: Product search input-এ 300-400ms debounce দিন, প্রতি keystroke-এ API call না করে।
+Virtualization: বড় product list/order history-তে react-window বা react-virtual ব্যবহার করুন — 1000 item render না করে শুধু visible অংশ render করবে।
+Optimistic UI: Cart add, order status change ইত্যাদিতে optimistic update দিন — user সাথে সাথে response দেখবে, server confirm হওয়ার আগেই (perceived speed বাড়ে)।
+6.3 CDN & Hosting
+Frontend static build Vercel/Netlify/Cloudflare Pages-এ deploy করুন — global CDN edge caching, তাই বাংলাদেশ থেকে হিট করলেও fast load।
+Static assets (JS/CSS/images) এর জন্য aggressive cache headers।
+6.4 Supabase Plan Consideration
+Free/Starter plan-এ connection limit কম থাকে (60-ish direct connections)। 1000 concurrent user সাপোর্ট করতে Supabase Pro plan (বা তার বেশি) লাগবে, সাথে Supavisor pooler mode "transaction" এ সেট করা।
+Read-heavy load (product browsing) এর জন্য Supabase Read Replica (higher tier-এ available) বিবেচনা করতে পারেন যদি traffic আরও বাড়ে।
+6.5 Realtime (দরকার হলে, optional)
+Order status live update দেখাতে Supabase Realtime ব্যবহার করতে পারেন, কিন্তু 1000 user সবাই realtime subscribe করলে load বাড়ে — শুধু active order tracking page-এ subscribe করান, পুরো app-এ না।
+7. Frontend Architecture (React)
+src/
+├── app/
+│   ├── routes/                 # role-based route definitions
+│   │   ├── PublicRoutes.tsx
+│   │   ├── UserRoutes.tsx
+│   │   ├── ModeratorRoutes.tsx
+│   │   ├── AdminRoutes.tsx
+│   │   └── SuperAdminRoutes.tsx
+│   └── App.tsx
+├── features/                   # feature-based structure (scalable)
+│   ├── auth/
+│   ├── products/
+│   ├── cart/
+│   ├── orders/
+│   ├── profile/
+│   ├── moderator/
+│   ├── admin/
+│   └── super-admin/
+├── shared/
+│   ├── components/             # Button, Modal, Table, etc.
+│   ├── hooks/
+│   ├── lib/
+│   │   └── supabaseClient.ts
+│   └── utils/
+├── store/                      # Zustand/Redux (cart, auth state)
+└── types/
+State Management: Global auth/cart state → Zustand (lightweight, Redux-এর চেয়ে simpler)। Server state → TanStack Query।
+Route Guard: প্রতিটা route-এ <ProtectedRoute allowedRoles={['admin','super_admin']}> টাইপ wrapper দিয়ে role check করবেন, কিন্তু মনে রাখবেন এটা শুধু UX — আসল security RLS policy-তে।
+Form Validation: React Hook Form + Zod schema — client-side validation + type safety।
+8. Security Checklist (Customer কে বিক্রি করার আগে অবশ্যই)
+ সব table-এ RLS enabled, কোনো table unprotected না
+ role column শুধু Edge Function দিয়ে পরিবর্তনযোগ্য, direct client update না
+ Environment variables (.env) — Supabase anon key public থাকবে (এটা normal), কিন্তু service_role key কখনো frontend-এ যাবে না, শুধু Edge Function/server-এ
+ Rate limiting — login attempt, order placement-এ (Supabase Auth-এ built-in আছে, extra Edge Function-এও যোগ করতে পারেন)
+ Input sanitization — SQL injection Supabase ORM দিয়ে auto-protected, কিন্তু XSS এর জন্য user input render করার সময় sanitize করুন
+ HTTPS enforced (CDN/hosting default দেয়)
+ Payment gateway PCI-compliant hosted checkout ব্যবহার করুন (bKash/SSLCommerz), কার্ড ডিটেইল নিজে store করবেন না
+ Audit log রাখুন sensitive actions-এর (role change, product delete, order cancel)
+9. Suggested Development Phases
+Phase	কাজ	সময় (approx.)
+Phase 1	DB schema + RLS + Auth setup	1 সপ্তাহ
+Phase 2	User features (browse, cart, order, profile)	2 সপ্তাহ
+Phase 3	Moderator panel (order mgmt, stock view)	1 সপ্তাহ
+Phase 4	Admin panel (product/stock CRUD, moderator approval)	1.5 সপ্তাহ
+Phase 5	Super admin panel (full user/role management)	1 সপ্তাহ
+Phase 6	Performance optimization + load testing (k6/Artillery দিয়ে 1000 user simulate)	1 সপ্তাহ
+Phase 7	Security audit + payment integration + deployment	1 সপ্তাহ
+Load Testing ছাড়া "1000 user handle করবে" বলা যাবে না — deployment-এর আগে অবশ্যই k6 বা Artillery দিয়ে simulate করে দেখতে হবে actual bottleneck কোথায়।
+
+10. Recommended Tech Stack Summary
+Layer	Technology
+Frontend	React 18 + Vite + TypeScript
+Styling	Tailwind CSS
+State (client)	Zustand
+State (server)	TanStack Query
+Forms	React Hook Form + Zod
+Backend	Supabase (Postgres, Auth, Storage, Edge Functions)
+Hosting (Frontend)	Vercel / Cloudflare Pages
+Payment	bKash / SSLCommerz (Bangladesh)
+Monitoring	Supabase Dashboard + Sentry (error tracking)
+Load Testing	k6
+পরবর্তী ধাপ
+এই ডকুমেন্ট একটা blueprint। এখন থেকে আমরা ধাপে ধাপে implement করতে পারি — যেমন প্রথমে Supabase-এ পুরো schema + RLS policy তৈরি, তারপর React project scaffold। আপনি চাইলে বলুন কোন অংশ থেকে শুরু করতে চান, আমি সরাসরি কোড লিখে দিতে পারি।
